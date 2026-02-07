@@ -1,0 +1,82 @@
+def optimized_multiline_extraction(pdf_path, column_config, proximity_ratio=1.1):
+    """
+    A barebones version of the Generic Proximity Parser.
+    Designed to be small and easily integrable into existing test cases.
+    
+    Args:
+        pdf_path: Path to the bank statement.
+        column_config: Dict mapping column names to [x_start, x_end].
+                       Example: {'Date': [0, 100], 'Description': [100, 400], 'Debit': [400, 500]}
+        proximity_ratio: Threshold for merging lines (1.1 is usually best for dense PDF).
+    """
+
+    def get_text_in_range(line, x_range):
+        """Helper to extract text from a specific horizontal range."""
+        words_in_range = [w['text'] for w in line if x_range[0] <= (w['x0'] + w['x1']) / 2 <= x_range[1]]
+        return " ".join(words_in_range).strip()
+
+    def is_date_row(text):
+        """Dynamic date detection (supports DD/MM/YY, DD-MM-YYYY, etc.)"""
+        return bool(re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text))
+
+    all_transactions = []
+    current_txn = None
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+            if not words: continue
+            
+            # Step 1: Group words into lines based on Y-coordinate clustering
+            words.sort(key=lambda x: x['top'])
+            lines = []
+            current_line_words = [words[0]]
+            for i in range(1, len(words)):
+                if abs(words[i]['top'] - current_line_words[-1]['top']) < 3: # 3px tolerance
+                    current_line_words.append(words[i])
+                else:
+                    lines.append(sorted(current_line_words, key=lambda x: x['x0']))
+                    current_line_words = [words[i]]
+            lines.append(sorted(current_line_words, key=lambda x: x['x0']))
+
+            # Step 2: Iterate lines and apply Proximity Splitting
+            for line in lines:
+                y_top = line[0]['top']
+                line_height = line[0]['bottom'] - line[0]['top']
+                
+                line_date_text = get_text_in_range(line, column_config.get('Date', [0, 125]))
+                has_date = is_date_row(line_date_text)
+                
+                # Check vertical proximity to previous line
+                is_close = False
+                if current_txn and 'last_y' in current_txn:
+                    vertical_gap = y_top - current_txn['last_y']
+                    is_close = vertical_gap < (line_height * proximity_ratio)
+
+                if has_date:
+                    if current_txn:
+                        all_transactions.append(current_txn)
+                    current_txn = {col: "" for col in column_config}
+                    current_txn['Date'] = line_date_text
+                
+                # If we have a transaction context AND either it's the start line OR a close following line
+                if current_txn and (has_date or is_close):
+                    for col_name, x_range in column_config.items():
+                        val = get_text_in_range(line, x_range)
+                        if val:
+                            if col_name == 'Description':
+                                current_txn[col_name] = (current_txn[col_name] + " " + val).strip()
+                            else:
+                                current_txn[col_name] = val # Populate amounts/dates
+                    current_txn['last_y'] = line[0]['bottom']
+
+    if current_txn:
+        all_transactions.append(current_txn)
+
+    # Clean up internal metadata and return DataFrame
+    results = pd.DataFrame(all_transactions)
+    if not results.empty and 'last_y' in results.columns:
+        results = results.drop(columns=['last_y'])
+    
+    return results
+
