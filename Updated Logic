@@ -1,0 +1,130 @@
+# ROW SEPERATOR LOGIC:
+
+def get_adaptive_explicit_lines(page):
+    """
+    Calculates horizontal line separators based on the MEDIAN GAP between text lines.
+    Groups words into lines first to avoid micro-splitting single lines.
+    """
+    try:
+        words = page.extract_words()
+        if not words: return []
+        
+        # Sort by Y-coordinate (top to bottom)
+        words.sort(key=lambda w: w['top'])
+        
+        # 1. Group words into physical lines with a vertical tolerance (3 points)
+        lines = []
+        if words:
+            current_line = [words[0]]
+            for i in range(1, len(words)):
+                if abs(words[i]['top'] - current_line[-1]['top']) < 3:
+                    current_line.append(words[i])
+                else:
+                    lines.append(current_line)
+                    current_line = [words[i]]
+            lines.append(current_line)
+            
+        # 2. Extract metrics for each grouped line (Top/Bottom)
+        line_metrics = []
+        for line in lines:
+            line_top = min(w['top'] for w in line)
+            line_bottom = max(w['bottom'] for w in line)
+            line_metrics.append({'top': line_top, 'bottom': line_bottom})
+            
+        if len(line_metrics) < 2: return []
+        
+        # 3. Calculate gaps between lines
+        gaps = []
+        for i in range(len(line_metrics) - 1):
+            gap = line_metrics[i+1]['top'] - line_metrics[i]['bottom']
+            if gap > 0:
+                gaps.append(gap)
+                
+        if not gaps: return []
+        
+        # Use median for better outlier resistance
+        median_gap = np.median(gaps)
+        
+        # Conservative threshold: 1.8x median or min 12 points
+        threshold = max(12, median_gap * 1.8)
+        
+        # 4. Generate Separators in significant gaps
+        explicit_lines = []
+        for i in range(len(line_metrics) - 1):
+            gap = line_metrics[i+1]['top'] - line_metrics[i]['bottom']
+            if gap > threshold:
+                split_point = line_metrics[i]['bottom'] + (gap / 2)
+                explicit_lines.append(split_point)
+                
+        return explicit_lines
+    except Exception as e:
+        print(f"[get_adaptive_explicit_lines] Error: {e}")
+        return []
+
+
+# INSIDE CLEANING FUNCTION:
+
+    # [FINAL RECTIFICATION] Logic to handle Multiline Descriptions + Same Day Transactions
+    clean_df_rows = []
+    current_txn = None
+    
+    # Helper to check if a row has any valid financial data (Amount or Balance)
+    def has_financial_data(row_dict):
+        for col in ['Debit', 'Credit', 'Balance']:
+            val = row_dict.get(col)
+            # Check for non-zero/non-empty numeric data
+            if pd.notna(val) and val != 0 and str(val).strip() != "" and str(val).lower() != 'nan':
+                return True
+        return False
+
+    for i, row in df.iterrows():
+        date_val = str(row.get('Value Date', '')).strip()
+        is_date_present = pd.notna(row.get('Value Date')) and date_val != "" and date_val.lower() != "nat"
+        
+        row_dict = row.to_dict()
+        
+        if is_date_present:
+            # CASE 1: New Date Found -> Start New Transaction
+            if current_txn:
+                clean_df_rows.append(current_txn)
+            current_txn = row_dict
+            
+        elif has_financial_data(row_dict):
+            # CASE 2: No Date, but has Amount/Balance -> New Transaction on the Same Day
+            if current_txn:
+                clean_df_rows.append(current_txn)
+                # Inherit the date from the previous transaction entry
+                prev_date = current_txn.get('Value Date')
+                current_txn = row_dict
+                current_txn['Value Date'] = prev_date
+            else:
+                current_txn = row_dict
+        
+        else:
+            # CASE 3: No Date and No Financial Data -> Multiline Continuation
+            if current_txn:
+                # Merge text from ALL non-financial columns to catch shifted data
+                merged_text = []
+                for col in df.columns:
+                    if col not in ["Debit", "Credit", "Balance", "Value Date"]:
+                        val = str(row[col]).strip()
+                        if val and val.lower() != 'nan' and val != 'None':
+                            merged_text.append(val)
+                
+                continuation_text = " ".join(merged_text).strip()
+                if continuation_text:
+                    # Append strictly with a space to previous description
+                    current_txn['Description'] = str(current_txn.get('Description', '')) + " " + continuation_text
+    
+    # Append the last transaction
+    if current_txn:
+        clean_df_rows.append(current_txn)
+        
+    df = pd.DataFrame(clean_df_rows)
+
+
+
+
+
+
+
